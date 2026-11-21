@@ -4,7 +4,7 @@ import time
 import aiohttp
 import pytest
 from aiohttp import web
-
+from models import HTMLParser
 from models import AsyncCrawler
 from utils import (
     AsyncClientError,
@@ -49,7 +49,7 @@ async def test_fetch_url_valid(test_server):
 
 
 async def test_fetch_urls_parallel_all_ok(test_server):
-    urls = [str(test_server.make_url("/ok")) for _ in range(5)]
+    urls = [str(test_server.make_url(f"/ok?i={i}")) for i in range(5)]
     async with AsyncCrawler(max_concurrent=5) as c:
         results = await c.fetch_urls(urls)
     assert len(results) == 5
@@ -75,25 +75,24 @@ async def test_500_raises_client_response_error(test_server):
 
 
 async def test_unreachable_host_raises_client_error():
-    """Несуществующий хост → сетевая ошибка."""
-    timeout = aiohttp.ClientTimeout(total=3, connect=1, sock_connect=1, sock_read=1)
-    async with AsyncCrawler(timeout=timeout) as c:
+    async with AsyncCrawler() as c:
         with pytest.raises(AsyncClientError):
-            await c.fetch_url("http://nonexistent-domain-xyz-12345.invalid")
+            await c.fetch_url("http://127.0.0.1:1/")  
 
 
 async def test_fetch_urls_skips_failures(test_server):
     """fetch_urls не падает, если часть URL сломана, и логирует ошибки (caplog)."""
-    good = str(test_server.make_url("/ok"))
+    good1 = str(test_server.make_url("/ok?i=1"))
+    good2 = str(test_server.make_url("/ok?i=2"))
     bad = str(test_server.make_url("/missing"))
-    urls = [good, bad, good]
+    urls = [good1, bad, good2]
 
     async with AsyncCrawler() as c:
         results = await c.fetch_urls(urls)
 
     assert len(results) == 2          # только 2 успешных
     assert bad not in results
-    assert results[good] == "hello"
+    assert results[good1] == "hello"
 
 
 # ---------- 3. Таймауты ----------
@@ -153,5 +152,95 @@ async def test_max_concurrent_respected(test_server):
         await asyncio.gather(*(c.fetch_url(u) for u in urls))
         elapsed = time.perf_counter() - t0
 
-    # 6 задач / лимит 2 = 3 волны * 0.3с ≈ 0.9с (с запасом < 1.6с)
     assert elapsed < 1.6
+
+SAMPLE_HTML = """
+<html>
+<head>
+  <title>Test Page</title>
+  <meta name="description" content="A test page">
+  <meta name="keywords" content="test, html, parser">
+</head>
+<body>
+  <h1>Main</h1><h2>Sub</h2><h3>Subsub</h3>
+  <p>Hello <a href="/rel">relative</a> and
+     <a href="https://other.com/abs">absolute</a>.</p>
+  <a href="javascript:void(0)">js</a>
+  <a href="#frag">frag</a>
+  <img src="/img/logo.png" alt="logo">
+  <table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>
+  <ul><li>one</li><li>two</li></ul>
+  <ol><li>first</li></ol>
+  <script>var x = 1;</script>
+</body>
+</html>
+"""
+
+
+@pytest.fixture
+def parser():
+    return HTMLParser()
+
+
+@pytest.mark.asyncio
+async def test_parse_html_full(parser):
+    result = await parser.parse_html(SAMPLE_HTML, "https://example.com/dir/page")
+    assert result["title"] == "Test Page"
+    assert result["metadata"]["description"] == "A test page"
+    assert result["metadata"]["keywords"] == ["test", "html", "parser"]
+    assert result["headings"]["h1"] == ["Main"]
+    assert "script" not in result["text"]
+    assert "Hello" in result["text"]
+
+
+@pytest.mark.asyncio
+async def test_links_absolute_and_filtered(parser):
+    result = await parser.parse_html(SAMPLE_HTML, "https://example.com/dir/page")
+    # /rel → https://example.com/rel; /img — не ссылка; js/# — отброшены
+    assert "https://example.com/rel" in result["links"]
+    assert "https://other.com/abs" in result["links"]
+    assert not any("javascript:" in l for l in result["links"])
+    assert not any("#frag" in l for l in result["links"])
+    # дубликатов нет
+    assert len(result["links"]) == len(set(result["links"]))
+
+
+@pytest.mark.asyncio
+async def test_filter_external():
+    p = HTMLParser(filter_external=True)
+    result = await p.parse_html(SAMPLE_HTML, "https://example.com/dir/page")
+    assert all("example.com" in l for l in result["links"])
+    assert "https://other.com/abs" not in result["links"]
+
+
+@pytest.mark.asyncio
+async def test_images_headings_tables_lists(parser):
+    r = await parser.parse_html(SAMPLE_HTML, "https://example.com/")
+    assert r["images"] == [{"src": "https://example.com/img/logo.png", "alt": "logo"}]
+    assert r["headings"] == {"h1": ["Main"], "h2": ["Sub"], "h3": ["Subsub"]}
+    assert r["tables"] == [[["A", "B"], ["1", "2"]]]
+    assert r["lists"]["ul"] == [["one", "two"]]
+    assert r["lists"]["ol"] == [["first"]]
+
+
+@pytest.mark.asyncio
+async def test_broken_html_returns_partial(parser):
+    broken = "<html><head><title>X</title><body><h1>Hi<p>no close"
+    r = await parser.parse_html(broken, "https://example.com/")
+    assert r["title"] == "X"
+    assert r["headings"]["h1"] == ["Hi"]
+    
+
+
+@pytest.mark.asyncio
+async def test_empty_html(parser):
+    r = await parser.parse_html("", "https://example.com/")
+    assert r["error"] == "empty html"
+    assert r["links"] == []
+
+
+@pytest.mark.asyncio
+async def test_none_soup_methods_dont_crash(parser):
+    assert parser.extract_links(None, "https://x/") == []
+    assert parser.extract_text(None) == ""
+    assert parser.extract_metadata(None)["title"] == ""
