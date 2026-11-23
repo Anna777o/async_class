@@ -5,15 +5,15 @@ import aiohttp
 import pytest
 from aiohttp import web
 from models import HTMLParser
-from models import AsyncCrawler
+from models import AsyncCrawler, URLFilter, CrawlerQueue
 from utils import (
     AsyncClientError,
     AsyncTimeoutError,
     AsyncClientResponseError,
 )
+from urllib.parse import urlparse
 
 
-# ---------- локальный сервер ----------
 
 @pytest.fixture
 async def test_server(aiohttp_server):
@@ -143,15 +143,23 @@ async def test_parallel_faster_than_sequential(test_server):
     )
 
 
+@pytest.mark.asyncio
 async def test_max_concurrent_respected(test_server):
-    """С limit_per_host=N 6 запросов по 0.3с должны идти волнами по N."""
-    urls = [str(test_server.make_url("/slow?delay=0.3")) for _ in range(6)]
+    urls = [
+        str(test_server.make_url(f"/slow?delay=0.3&i={i}"))
+        for i in range(6)
+    ]
 
     async with AsyncCrawler(max_concurrent=2) as c:
         t0 = time.perf_counter()
-        await asyncio.gather(*(c.fetch_url(u) for u in urls))
+
+        await asyncio.gather(
+            *(c._fetch_guarded(url) for url in urls)
+        )
+
         elapsed = time.perf_counter() - t0
 
+    assert elapsed >= 0.8
     assert elapsed < 1.6
 
 SAMPLE_HTML = """
@@ -244,3 +252,252 @@ async def test_none_soup_methods_dont_crash(parser):
     assert parser.extract_links(None, "https://x/") == []
     assert parser.extract_text(None) == ""
     assert parser.extract_metadata(None)["title"] == ""
+
+#day3
+# ---------- очередь ----------
+
+async def test_queue_priority_order():
+    q = CrawlerQueue()
+    await q.add_url("http://a/1", priority=0)
+    await q.add_url("http://a/2", priority=5)
+    await q.add_url("http://a/3", priority=-1)
+
+    order = []
+    for _ in range(3):
+        url, _depth = await q.get_next_with_depth()
+        order.append(url)
+        await q.mark_processed(url)          # ← обязательно: декремент in_progress
+
+    assert order == ["http://a/2", "http://a/1", "http://a/3"]
+
+
+async def test_queue_returns_depth():
+    q = CrawlerQueue()
+    await q.add_url("http://a/1", depth=0)
+    await q.add_url("http://a/2", depth=3)
+
+    url0, depth0 = await q.get_next_with_depth()
+    await q.mark_processed(url0)
+    url1, depth1 = await q.get_next_with_depth()
+    await q.mark_processed(url1)
+
+    assert (url0, depth0) == ("http://a/1", 0)
+    assert (url1, depth1) == ("http://a/2", 3)
+
+
+async def test_queue_get_next_wrapper_returns_str():
+    """Публичный get_next (по ТЗ) возвращает str, не tuple."""
+    q = CrawlerQueue()
+    await q.add_url("http://a/1", depth=5)
+    url = await q.get_next()
+    assert url == "http://a/1"
+    assert isinstance(url, str)
+    await q.mark_processed(url)
+
+
+async def test_queue_deduplicates():
+    q = CrawlerQueue()
+    assert await q.add_url("http://a/1") is True
+    assert await q.add_url("http://a/1") is False
+    assert len(q) == 1
+
+
+async def test_queue_mark_processed_prevents_requeue():
+    q = CrawlerQueue()
+    await q.add_url("http://a/1")
+    url = await q.get_next()
+    await q.mark_processed(url)
+    assert await q.add_url("http://a/1") is False
+    assert "http://a/1" in q.visited_urls
+
+
+async def test_queue_stats():
+    q = CrawlerQueue()
+    await q.add_url("http://a/1")
+    url = await q.get_next()
+    await q.mark_failed(url, "boom")
+    stats = q.get_stats()
+    assert stats["failed"] == 1
+    assert stats["queued"] == 0
+    assert stats["in_progress"] == 0
+    assert stats["total_done"] == 1
+
+
+async def test_queue_get_next_waits_for_in_progress():
+    """
+    get_next НЕ возвращает None, пока есть задачи в полёте:
+    даже если куча пуста, воркер может добавить новые ссылки.
+    """
+    q = CrawlerQueue()
+    await q.add_url("http://a/1")
+
+    url = await q.get_next_with_depth()
+    assert url is not None and url[0] == "http://a/1"
+
+    # куча пуста, in_progress == 1 → get_next должен ждать, а не вернуть None
+    task = asyncio.create_task(q.get_next_with_depth())
+    await asyncio.sleep(0.1)
+    assert not task.done(), "get_next вернул None, хотя in_progress > 0"
+
+    # добавляем новый URL и освобождаем текущий — get_next должен отдать новый
+    await q.add_url("http://a/2")
+    await q.mark_processed("http://a/1")
+
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert result == ("http://a/2", 0)
+
+
+async def test_queue_get_next_returns_none_when_done():
+    """in_progress == 0 и куча пуста → None."""
+    q = CrawlerQueue()
+    assert await q.get_next_with_depth() is None
+
+
+# ═══════════════════════════ ФИЛЬТРЫ ═══════════════════════════
+
+def test_filter_same_domain():
+    f = URLFilter(same_domain_only=True)
+    assert f.allowed("https://example.com/a", "example.com")
+    assert not f.allowed("https://other.com/a", "example.com")
+
+
+def test_filter_include_exclude():
+    f = URLFilter(
+        include_patterns=[r"/docs/"],
+        exclude_patterns=[r"\.pdf$"],
+    )
+    assert f.allowed("https://x.com/docs/a")
+    assert not f.allowed("https://x.com/blog/b")
+    assert not f.allowed("https://x.com/docs/a.pdf")
+
+
+def test_filter_rejects_non_http():
+    f = URLFilter()
+    assert not f.allowed("mailto:a@b.c")
+    assert not f.allowed("javascript:void(0)")
+    assert not f.allowed("ftp://x/y")
+
+
+# ═══════════════════════════ КРАУЛИНГ ═══════════════════════════
+
+@pytest.fixture
+async def site(aiohttp_server):
+    """Цепочка /d0 → /d1 → /d2 → /d3, каждая страница ссылается на следующую."""
+    async def page(request):
+        depth = int(request.match_info["depth"])
+        links = ""
+        if depth < 3:
+            links = f'<a href="/d{depth+1}">next</a>'
+        return web.Response(
+            text=f"<html><head><title>D{depth}</title></head>"
+                 f"<body><h1>d{depth}</h1>{links}</body></html>",
+            content_type="text/html",
+        )
+
+    app = web.Application()
+    app.router.add_get("/d{depth}", page)
+    return await aiohttp_server(app)
+
+
+@pytest.fixture
+async def wide_site(aiohttp_server):
+    """Корень со ссылками на 100 страниц — для проверки max_pages."""
+    async def root(request):
+        links = "".join(f'<a href="/p{i}">p{i}</a>' for i in range(100))
+        return web.Response(
+            text=f"<html><body>{links}</body></html>",
+            content_type="text/html",
+        )
+
+    async def page(request):
+        return web.Response(text="<html><body>leaf</body></html>",
+                            content_type="text/html")
+
+    app = web.Application()
+    app.router.add_get("/", root)
+    app.router.add_get("/p{i}", page)
+    return await aiohttp_server(app)
+
+
+async def test_crawl_respects_max_depth(site):
+    start = str(site.make_url("/d0"))
+    async with AsyncCrawler(max_concurrent=3, max_depth=1) as c:
+        results = await c.crawl([start], max_pages=10)
+
+    depths = {r["depth"] for r in results.values()}
+    assert depths <= {0, 1}, f"глубина превышена: {depths}"
+    # /d0 (depth 0), /d1 (depth 1), /d2 не должен попасть
+    assert len(results) == 2
+
+
+async def test_crawl_depth_matches_queue(site):
+    """Проверяем, что depth из очереди доходит до результатов корректно."""
+    start = str(site.make_url("/d0"))
+    async with AsyncCrawler(max_concurrent=3, max_depth=3) as c:
+        results = await c.crawl([start], max_pages=10)
+
+    by_depth = {r["depth"] for r in results.values()}
+    assert by_depth == {0, 1, 2, 3}
+    # ключи результатов — URL, и их глубина ровно та, что в пути
+    for url, r in results.items():
+        assert f"/d{r['depth']}" in url
+
+
+async def test_crawl_max_pages_strict(wide_site):
+    start = str(wide_site.make_url("/"))
+    async with AsyncCrawler(max_concurrent=5, max_depth=1) as c:
+        results = await c.crawl([start], max_pages=7)
+
+    assert len(results) <= 7
+
+
+async def test_crawl_no_duplicates(wide_site):
+    start = str(wide_site.make_url("/"))
+    async with AsyncCrawler(max_concurrent=5, max_depth=1) as c:
+        await c.crawl([start], max_pages=20)
+        visited = c.queue.visited_urls
+
+    assert len(visited) == len(set(visited)), "в visited_urls есть дубликаты"
+
+
+async def test_crawl_same_domain_only(site):
+    start = str(site.make_url("/d0"))
+    async with AsyncCrawler(max_concurrent=3, max_depth=2) as c:
+        results = await c.crawl(
+            [start], max_pages=10, same_domain_only=True,
+        )
+    host = site.make_url("/").host
+    for url in results:
+        assert urlparse(url).hostname== host
+
+
+async def test_crawl_exclude_patterns(site):
+    start = str(site.make_url("/d0"))
+    async with AsyncCrawler(max_concurrent=3, max_depth=3) as c:
+        results = await c.crawl(
+            [start], max_pages=10,
+            exclude_patterns=[r"/d2$"],  # не идём в /d2 → /d3 недостижим
+        )
+    assert not any(url.endswith("/d2") for url in results)
+    assert not any(url.endswith("/d3") for url in results)
+
+
+async def test_crawl_empty_after_filter(site):
+    """Если стартовый URL отфильтрован — возвращаем пустой dict, не виснем."""
+    start = str(site.make_url("/d0"))
+    async with AsyncCrawler(max_concurrent=3, max_depth=1) as c:
+        results = await c.crawl(
+            [start], max_pages=10,
+            include_patterns=[r"/never-matches/"],
+        )
+    assert results == {}
+
+@pytest.mark.asyncio
+async def test_fetch_with_status_returns_status_and_body(test_server):
+    async with AsyncCrawler() as c:
+        url = str(test_server.make_url("/ok"))
+
+        status, body = await c.fetch_with_status(url)
+
+    assert status == 200
+    assert body == "hello"

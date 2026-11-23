@@ -4,7 +4,7 @@ import time
 import json
 from models import AsyncCrawler, HTMLParser
 from utils import AsyncClientError, AsyncTimeoutError, AsyncClientResponseError
-
+from aiohttp import web
 
 URLS = [
     "https://www.python.org",
@@ -148,7 +148,142 @@ async def main() -> None:
     print(f"\n>>> Ускорение параллельной загрузки: x{speedup:.2f}")
     print(f"    последовательно: {seq_time:.2f} сек, параллельно: {par_time:.2f} сек")
 
+async def main3() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    async def d0(request):
+        return web.Response(
+            text="""
+            <html>
+                <body>
+                    <h1>Depth 0</h1>
+                    <a href="/d1">Go to depth 1</a>
+                </body>
+            </html>
+            """,
+            content_type="text/html",
+        )
+
+    async def d1(request):
+        return web.Response(
+            text="""
+            <html>
+                <body>
+                    <h1>Depth 1</h1>
+                    <a href="/d2">Go to depth 2</a>
+                </body>
+            </html>
+            """,
+            content_type="text/html",
+        )
+
+    async def d2(request):
+        return web.Response(
+            text="""
+            <html>
+                <body>
+                    <h1>Depth 2</h1>
+                    <a href="/d3">Go to depth 3</a>
+                </body>
+            </html>
+            """,
+            content_type="text/html",
+        )
+
+    async def d3(request):
+        return web.Response(
+            text="""
+            <html>
+                <body>
+                    <h1>Depth 3</h1>
+                    <p>Последний уровень.</p>
+                </body>
+            </html>
+            """,
+            content_type="text/html",
+        )
+
+    app = web.Application()
+
+    app.router.add_get("/", d0)
+    app.router.add_get("/d1", d1)
+    app.router.add_get("/d2", d2)
+    app.router.add_get("/d3", d3)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+
+    # Получаем фактический порт.
+    port = site._server.sockets[0].getsockname()[1]
+    start = f"http://127.0.0.1:{port}/"
+
+    print(f"\nСтартовый URL: {start}")
+
+    t0 = time.perf_counter()
+
+    try:
+        async with AsyncCrawler(
+            max_concurrent=10,
+            max_depth=3,
+            per_domain_limit=2,
+        ) as crawler:
+            results = await crawler.crawl(
+                start_urls=[start],
+                max_pages=20,
+                same_domain_only=True,
+            )
+
+            stats = crawler.queue.get_stats()
+
+            elapsed = time.perf_counter() - t0
+            speed = len(results) / elapsed if elapsed else 0
+
+            print("\n" + "=" * 70)
+            print(f"Обработано страниц: {len(results)}")
+            print(
+                f"Время: {elapsed:.2f} сек, "
+                f"скорость: {speed:.2f} стр/сек"
+            )
+            print(f"Статистика очереди: {stats}")
+            print(
+                f"Активно: total={crawler.sems.active_total}, "
+                f"by_domain={crawler.sems.active_by_domain()}"
+            )
+            print("=" * 70)
+
+            by_depth: dict[int, list[str]] = {}
+
+            for url, result in results.items():
+                by_depth.setdefault(result["depth"], []).append(url)
+
+            for depth in sorted(by_depth):
+                urls = by_depth[depth]
+
+                print(
+                    f"\n--- Глубина {depth}: "
+                    f"{len(urls)} стр. ---"
+                )
+
+                for url in urls:
+                    result = results[url]
+
+                    print(f"  {url}")
+                    print(
+                        f"    title={result['title']!r} "
+                        f"links={len(result['links'])} "
+                        f"text_len={len(result['text'])}"
+                    )
+
+    finally:
+        await runner.cleanup()
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    asyncio.run(main2())
+    #asyncio.run(main())
+    #asyncio.run(main2())
+    asyncio.run(main3())
