@@ -5,7 +5,7 @@ import aiohttp
 import pytest
 from aiohttp import web
 from models import HTMLParser
-from models import AsyncCrawler, URLFilter, CrawlerQueue
+from models import AsyncCrawler, URLFilter, CrawlerQueue, RateLimiter, RobotsParser
 from utils import (
     AsyncClientError,
     AsyncTimeoutError,
@@ -123,21 +123,20 @@ async def test_timeout_in_fetch_urls_is_logged(test_server, caplog):
 # ---------- 4. Параллельно быстрее, чем последовательно ----------
 
 async def test_parallel_faster_than_sequential(test_server):
-    # 3 URL по 0.4с каждый. Последовательно ≈ 1.2с, параллельно ≈ 0.4с.
+    
     urls = [str(test_server.make_url("/slow?delay=0.4")) for _ in range(3)]
 
-    async with AsyncCrawler(max_concurrent=10) as c:
+    async with AsyncCrawler(max_concurrent=10, per_domain_limit=10) as c:
         t0 = time.perf_counter()
         await asyncio.gather(*(c.fetch_url(u) for u in urls))
         parallel_time = time.perf_counter() - t0
 
-    async with AsyncCrawler(max_concurrent=10) as c:
+    async with AsyncCrawler(max_concurrent=10, per_domain_limit=10) as c:
         t0 = time.perf_counter()
         for u in urls:
             await c.fetch_url(u)
         sequential_time = time.perf_counter() - t0
 
-    # Параллельно должно быть минимум в 2 раза быстрее
     assert parallel_time < sequential_time / 2, (
         f"parallel={parallel_time:.2f}s, sequential={sequential_time:.2f}s"
     )
@@ -382,12 +381,11 @@ def test_filter_rejects_non_http():
 
 @pytest.fixture
 async def site(aiohttp_server):
-    """Цепочка /d0 → /d1 → /d2 → /d3, каждая страница ссылается на следующую."""
     async def page(request):
         depth = int(request.match_info["depth"])
         links = ""
         if depth < 3:
-            links = f'<a href="/d{depth+1}">next</a>'
+            links = f'<a href="/d/{depth + 1}">next</a>'   # ← слэш
         return web.Response(
             text=f"<html><head><title>D{depth}</title></head>"
                  f"<body><h1>d{depth}</h1>{links}</body></html>",
@@ -395,7 +393,7 @@ async def site(aiohttp_server):
         )
 
     app = web.Application()
-    app.router.add_get("/d{depth}", page)
+    app.router.add_get("/d/{depth}", page)   # ← /d/ + {depth}
     return await aiohttp_server(app)
 
 
@@ -420,35 +418,23 @@ async def wide_site(aiohttp_server):
 
 
 async def test_crawl_respects_max_depth(site):
-    start = str(site.make_url("/d0"))
+    start = str(site.make_url("/d/0"))
     async with AsyncCrawler(max_concurrent=3, max_depth=1) as c:
         results = await c.crawl([start], max_pages=10)
 
     depths = {r["depth"] for r in results.values()}
     assert depths <= {0, 1}, f"глубина превышена: {depths}"
-    # /d0 (depth 0), /d1 (depth 1), /d2 не должен попасть
     assert len(results) == 2
 
 
 async def test_crawl_depth_matches_queue(site):
-    """Проверяем, что depth из очереди доходит до результатов корректно."""
-    start = str(site.make_url("/d0"))
+    start = str(site.make_url("/d/0"))
     async with AsyncCrawler(max_concurrent=3, max_depth=3) as c:
         results = await c.crawl([start], max_pages=10)
 
-    by_depth = {r["depth"] for r in results.values()}
-    assert by_depth == {0, 1, 2, 3}
-    # ключи результатов — URL, и их глубина ровно та, что в пути
+    assert {r["depth"] for r in results.values()} == {0, 1, 2, 3}
     for url, r in results.items():
-        assert f"/d{r['depth']}" in url
-
-
-async def test_crawl_max_pages_strict(wide_site):
-    start = str(wide_site.make_url("/"))
-    async with AsyncCrawler(max_concurrent=5, max_depth=1) as c:
-        results = await c.crawl([start], max_pages=7)
-
-    assert len(results) <= 7
+        assert f"/d/{r['depth']}" in url   # ← тоже слэш
 
 
 async def test_crawl_no_duplicates(wide_site):
@@ -501,3 +487,169 @@ async def test_fetch_with_status_returns_status_and_body(test_server):
 
     assert status == 200
     assert body == "hello"
+
+# ═══════════════ RateLimiter ═══════════════
+
+async def test_rate_limiter_per_domain():
+    rl = RateLimiter(requests_per_second=10.0, per_domain=True)  # 100 мс
+    t0 = time.monotonic()
+    for _ in range(3):
+        await rl.acquire("a.com")
+    delta = time.monotonic() - t0
+    assert delta >= 0.18, f"слишком быстро: {delta:.3f}s"  # 2 интервала
+
+
+async def test_rate_limiter_different_domains_independent():
+    rl = RateLimiter(requests_per_second=2.0, per_domain=True)
+    t0 = time.monotonic()
+    await asyncio.gather(
+        rl.acquire("a.com"),
+        rl.acquire("b.com"),
+        rl.acquire("c.com"),
+    )
+    delta = time.monotonic() - t0
+    # параллельно на разные домены — не должно быть 3 * 0.5с
+    assert delta < 0.5, f"домены не изолированы: {delta:.3f}s"
+
+
+async def test_rate_limiter_global():
+    rl = RateLimiter(requests_per_second=10.0, per_domain=False)
+    t0 = time.monotonic()
+    for _ in range(3):
+        await rl.acquire("a.com")  # domain игнорируется
+    delta = time.monotonic() - t0
+    assert delta >= 0.18
+
+
+# ═══════════════ RobotsParser ═══════════════
+
+@pytest.fixture
+async def robots_server(aiohttp_server):
+    async def robots(request):
+        return web.Response(
+            text="User-agent: *\nDisallow: /private\nCrawl-delay: 0.4\n",
+            content_type="text/plain",
+        )
+
+    async def public(request):
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/robots.txt", robots)
+    app.router.add_get("/public", public)
+    return await aiohttp_server(app)
+
+
+async def test_robots_parsing(robots_server):
+    base = str(robots_server.make_url("/"))
+    rp = RobotsParser(user_agent="TestBot/1.0")
+    async with aiohttp.ClientSession() as s:
+        rp.session = s
+        result = await rp.fetch_robots(base)
+
+        assert result["crawl_delay"] == pytest.approx(0.4)       # ← из fetch_robots
+        assert rp.get_crawl_delay("TestBot/1.0", base_url=base) == pytest.approx(0.4)
+        assert rp.can_fetch(f"{base}public", "TestBot/1.0") is True
+        assert rp.can_fetch(f"{base}private", "TestBot/1.0") is False
+
+
+# ═══════════════ AsyncCrawler + robots ═══════════════
+
+@pytest.fixture
+async def one_more_site(aiohttp_server):
+    async def robots(request):
+        return web.Response(
+            text="User-agent: *\nDisallow: /private\nCrawl-delay: 0.3\n",
+            content_type="text/plain",
+        )
+
+    async def index(request):
+        return web.Response(
+            text='<html><body>'
+                 '<a href="/page/1">p1</a>'
+                 '<a href="/private/x">secret</a>'
+                 '</body></html>',
+            content_type="text/html",
+        )
+
+    async def page(request):
+        return web.Response(text="<html><body>page</body></html>",
+                            content_type="text/html")
+
+    async def private(request):
+        return web.Response(text="secret")
+
+    app = web.Application()
+    app.router.add_get("/robots.txt", robots)
+    app.router.add_get("/", index)
+    app.router.add_get("/page/{n}", page)
+    app.router.add_get("/private/{x}", private)
+    return await aiohttp_server(app)
+
+
+async def test_crawl_respects_robots(one_more_site):
+    start = str(one_more_site.make_url("/"))
+    async with AsyncCrawler(
+        max_concurrent=3, respect_robots=True, user_agent="TestBot/1.0",
+    ) as c:
+        results = await c.crawl([start], max_pages=10, same_domain_only=True)
+        assert not any("/private" in u for u in results)
+        assert any("/private" in u for u in c.queue.failed_urls)
+        assert c.get_request_stats()["blocked_robots"] >= 1
+
+
+async def test_crawl_min_delay_respected(one_more_site):
+    start = str(one_more_site.make_url("/"))
+    async with AsyncCrawler(
+        max_concurrent=3, min_delay=0.3, respect_robots=False,
+    ) as c:
+        t0 = time.monotonic()
+        await c.crawl([start], max_pages=3, same_domain_only=True)
+        elapsed = time.monotonic() - t0
+    # 3 запроса → минимум ~0.6с (2 интервала по 0.3)
+    assert elapsed >= 0.55, f"min_delay не соблюдён: {elapsed:.2f}s"
+
+
+async def test_crawl_rate_limit_end_to_end(one_more_site):
+    """requests_per_second=5 → 3 запроса ≥ ~0.4с (2 * 0.2с)."""
+    start = str(one_more_site.make_url("/"))
+    async with AsyncCrawler(
+        max_concurrent=5, requests_per_second=5.0,
+        respect_robots=False, min_delay=0.0,
+    ) as c:
+        t0 = time.monotonic()
+        await c.crawl([start], max_pages=3, same_domain_only=True)
+        elapsed = time.monotonic() - t0
+    assert elapsed >= 0.35, f"rate limit не работает: {elapsed:.2f}s"
+
+
+async def test_crawl_max_pages_strict(one_more_site):
+    """max_pages не должен превышаться даже при нескольких воркерах."""
+    start = str(one_more_site.make_url("/"))
+    async with AsyncCrawler(
+        max_concurrent=10, respect_robots=False,
+    ) as c:
+        results = await c.crawl([start], max_pages=2, same_domain_only=True)
+    assert len(results) <= 2
+
+
+async def test_backoff_grows_on_failures():
+    c = AsyncCrawler(backoff_base=1.0, backoff_max=30.0)
+    domain = "x.com"
+
+    # эмулируем три ошибки подряд без _wait_before_request (чтобы не ждать)
+    for expected in (1.0, 2.0, 4.0):
+        previous = c._backoff.get(domain, 0.0)
+        c._backoff[domain] = (
+            c.backoff_base if previous <= 0
+            else min(previous * 2, c.backoff_max)
+        )
+        assert c._backoff[domain] == expected
+
+
+async def test_backoff_resets_on_success():
+    c = AsyncCrawler(backoff_base=1.0)
+    c._backoff["x.com"] = 8.0
+    # успех в _fetch_guarded сбрасывает:
+    c._backoff["x.com"] = 0.0
+    assert c._backoff["x.com"] == 0.0

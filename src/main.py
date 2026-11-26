@@ -283,7 +283,158 @@ async def main3() -> None:
     finally:
         await runner.cleanup()
 
+async def start_site(port: int = 8766) -> web.AppRunner:
+    async def robots(request):
+        return web.Response(
+            text=(
+                "User-agent: *\n"
+                "Disallow: /private\n"
+                "Crawl-delay: 0.4\n"
+            ),
+            content_type="text/plain",
+        )
+
+    async def index(request):
+        links = "".join(
+            f'<a href="/page/{i}">page {i}</a> ' for i in range(1, 6)
+        )
+        links += '<a href="/private/secret">secret</a>'
+        return web.Response(
+            text=f"<html><head><title>Index</title></head>"
+                 f"<body><h1>Index</h1>{links}</body></html>",
+            content_type="text/html",
+        )
+
+    async def page(request):
+        n = int(request.match_info["n"])
+        # немного серверной задержки, чтобы rate limiting был виден
+        await asyncio.sleep(0.05)
+        return web.Response(
+            text=f"<html><head><title>Page {n}</title></head>"
+                 f"<body><h1>Page {n}</h1></body></html>",
+            content_type="text/html",
+        )
+
+    async def private(request):
+        return web.Response(text="secret")
+
+    app = web.Application()
+    app.router.add_get("/robots.txt", robots)
+    app.router.add_get("/", index)
+    app.router.add_get("/page/{n}", page)
+    app.router.add_get("/private/{x}", private)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    return runner
+
+
+# ───────────────────── main ─────────────────────
+
+async def main4() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    PORT = 8766
+    runner = await start_site(PORT)
+    start = f"http://127.0.0.1:{PORT}/"
+    print(f"Локальный сайт: {start}")
+
+    t0 = time.perf_counter()
+    try:
+        async with AsyncCrawler(
+            max_concurrent=5,
+            max_depth=2,
+            per_domain_limit=2,
+            requests_per_second=2.0,       # 2 запроса/сек на домен
+            rate_limit_per_domain=True,
+            respect_robots=True,           # соблюдаем robots.txt
+            min_delay=0.3,
+            jitter=0.1,
+            user_agent="MyBot/1.0",
+        ) as crawler:
+            results = await crawler.crawl(
+                start_urls=[start],
+                max_pages=20,
+                same_domain_only=True,
+                exclude_patterns=[r"\.(?:jpg|png|gif|svg|zip|pdf)$"],
+            )
+
+            queue_stats = crawler.queue.get_stats()
+            request_stats = crawler.get_request_stats()
+            failed = crawler.queue.failed_urls
+    finally:
+        await runner.cleanup()
+
+    elapsed = time.perf_counter() - t0
+
+    # ─────────── 1. Сводка ───────────
+    print("\n" + "=" * 70)
+    print(f"Обработано страниц: {len(results)}")
+    print(f"Время: {elapsed:.2f} сек")
+    print(f"Скорость crawler: {len(results) / elapsed:.2f} стр/сек")
+    print(f"Запросов (fetch): {request_stats['requests']}")
+    print(f"Текущая скорость: {request_stats['requests_per_sec']:.2f} req/sec")
+    print(f"Средняя задержка: {request_stats['average_delay'] * 1000:.0f} мс")
+    print(f"Заблокировано robots.txt: {request_stats['blocked_robots']}")
+    print(f"Статистика очереди: {queue_stats}")
+    print(f"Активно: total={crawler.sems.active_total}, "
+          f"by_domain={crawler.sems.active_by_domain()}")
+    print("=" * 70)
+
+    # ─────────── 2. По глубине ───────────
+    by_depth: dict[int, list[str]] = {}
+    for url, result in results.items():
+        by_depth.setdefault(result["depth"], []).append(url)
+
+    for depth in sorted(by_depth):
+        print(f"\n--- Глубина {depth}: {len(by_depth[depth])} стр. ---")
+        for url in by_depth[depth]:
+            r = results[url]
+            print(f"  {url}")
+            print(f"    title={r['title']!r} "
+                  f"links={len(r['links'])} text_len={len(r['text'])}")
+
+    # ─────────── 3. Заблокированные robots.txt ───────────
+    print(f"\n--- Заблокировано robots.txt: {len(failed)} ---")
+    for url, err in failed.items():
+        print(f"  {url}")
+        print(f"    reason: {err}")
+
+    # ─────────── 4. Соблюдение robots.txt: контроль ───────────
+    # Не едим ли мы /private, хотя он есть на индексе?
+    assert not any("/private" in u for u in results), \
+        "ОШИБКА: /private попал в результаты, robots.txt не соблюдён"
+    assert any("/private" in u for u in failed), \
+        "ОШИБКА: /private не заблокирован robots.txt"
+    assert request_stats["blocked_robots"] >= 1, \
+        f"ОШИБКА: blocked_robots={request_stats['blocked_robots']}"
+
+    # Rate limit: фактическая скорость не должна превышать лимит заметно
+    actual_rate = request_stats["requests_per_sec"]
+    print(f"\nПроверка rate limiting: "
+          f"факт {actual_rate:.2f} req/sec ≤ 2.0 + запас")
+    assert actual_rate <= 3.0, \
+        f"ОШИБКА: rate limit не соблюдён, {actual_rate:.2f} req/sec"
+
+    # ─────────── 5. Сохранить результаты ───────────
+    with open("crawl_results.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {"results": results, "failed": failed,
+             "request_stats": request_stats, "queue_stats": queue_stats},
+            f, ensure_ascii=False, indent=2,
+        )
+    print("\nРезультаты сохранены: crawl_results.json")
+
 if __name__ == "__main__":
-    #asyncio.run(main())
-    #asyncio.run(main2())
-    asyncio.run(main3())
+    print("day1")
+   # asyncio.run(main())
+    print("day2")
+  #  asyncio.run(main2())
+    print("day3")
+   # asyncio.run(main3())
+    print("day4")
+    asyncio.run(main4())

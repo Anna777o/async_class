@@ -1,15 +1,111 @@
 {
-  "https://example.com": {
-    "url": "https://example.com",
-    "depth": 0,
-    "title": "Example Domain",
-    "text": "Example Domain This domain is for use in documentation examples without needing permission. This is not a service; avoid relying on it for testing and monitoring purposes.",
-    "links": [],
-    "metadata": {
-      "title": "Example Domain",
-      "description": "",
-      "keywords": []
+  "results": {
+    "http://127.0.0.1:8766/": {
+      "url": "http://127.0.0.1:8766/",
+      "depth": 0,
+      "title": "Index",
+      "text": "Index Index page 1 page 2 page 3 page 4 page 5 secret",
+      "links": [
+        "http://127.0.0.1:8766/page/1",
+        "http://127.0.0.1:8766/page/2",
+        "http://127.0.0.1:8766/page/3",
+        "http://127.0.0.1:8766/page/4",
+        "http://127.0.0.1:8766/page/5",
+        "http://127.0.0.1:8766/private/secret"
+      ],
+      "metadata": {
+        "title": "Index",
+        "description": "",
+        "keywords": []
+      },
+      "error": null
     },
-    "error": null
+    "http://127.0.0.1:8766/page/1": {
+      "url": "http://127.0.0.1:8766/page/1",
+      "depth": 1,
+      "title": "Page 1",
+      "text": "Page 1 Page 1",
+      "links": [],
+      "metadata": {
+        "title": "Page 1",
+        "description": "",
+        "keywords": []
+      },
+      "error": null
+    },
+    "http://127.0.0.1:8766/page/2": {
+      "url": "http://127.0.0.1:8766/page/2",
+      "depth": 1,
+      "title": "Page 2",
+      "text": "Page 2 Page 2",
+      "links": [],
+      "metadata": {
+        "title": "Page 2",
+        "description": "",
+        "keywords": []
+      },
+      "error": null
+    },
+    "http://127.0.0.1:8766/page/3": {
+      "url": "http://127.0.0.1:8766/page/3",
+      "depth": 1,
+      "title": "Page 3",
+      "text": "Page 3 Page 3",
+      "links": [],
+      "metadata": {
+        "title": "Page 3",
+        "description": "",
+        "keywords": []
+      },
+      "error": null
+    },
+    "http://127.0.0.1:8766/page/4": {
+      "url": "http://127.0.0.1:8766/page/4",
+      "depth": 1,
+      "title": "Page 4",
+      "text": "Page 4 Page 4",
+      "links": [],
+      "metadata": {
+        "title": "Page 4",
+        "description": "",
+        "keywords": []
+      },
+      "error": null
+    },
+    "http://127.0.0.1:8766/page/5": {
+      "url": "http://127.0.0.1:8766/page/5",
+      "depth": 1,
+      "title": "Page 5",
+      "text": "Page 5 Page 5",
+      "links": [],
+      "metadata": {
+        "title": "Page 5",
+        "description": "",
+        "keywords": []
+      },
+      "error": null
+    }
+  },
+  "failed": {
+    "http://127.0.0.1:8766/private/secret": "blocked_by_robots"
+  },
+  "request_stats": {
+    "requests": 7,
+    "blocked_robots": 1,
+    "total_delay": 7.976403280319859,
+    "last_request": null,
+    "requests_per_sec": 2.282436024834721,
+    "average_delay": 1.139486182902837,
+    "elapsed_sec": 3.0668986660894006,
+    "blocked_ratio": 0.14285714285714285
+  },
+  "queue_stats": {
+    "queued": 0,
+    "in_progress": 0,
+    "processed": 6,
+    "failed": 1,
+    "total_done": 7,
+    "rate_per_sec": 2.2824822907349205,
+    "elapsed_sec": 3.07
   }
 }
