@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 import json
 from bs4 import BeautifulSoup
 from typing import Any, Dict, Optional
-from utils import AsyncClientError, AsyncTimeoutError, AsyncClientResponseError
+from utils import AsyncClientError, AsyncTimeoutError, AsyncClientResponseError, TransientError, NetworkError, PermanentError, CircuitOpenError
 import time
 import heapq
 import aiohttp
@@ -16,9 +16,13 @@ import random
 from typing import Iterable, Pattern
 from urllib.robotparser import RobotFileParser
 from collections import defaultdict
+from typing import Awaitable, Callable, TypeVar
+from dataclasses import dataclass, field
+from circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
+RETRYABLE_STATUS = {429, 500, 502, 503, 504, 529}
 class AsyncCrawler:
     def __init__(self, max_concurrent: int = 10, timeout: Optional[aiohttp.ClientTimeout] = None, filter_external_links: bool = False, max_depth: int = 2,
         per_domain_limit: int = 2, requests_per_second: float | None = None, rate_limit_per_domain: bool = True, respect_robots: bool = False,
@@ -26,7 +30,13 @@ class AsyncCrawler:
         jitter: float = 0.0,
         user_agent: str = "AsyncCrawler/1.0",
         backoff_base: float = 1.0,
-        backoff_max: float = 30.):
+        backoff_max: float = 30.0,
+        backoff_factor: float = 2.0, 
+        max_retries: int = 2,
+        circuit_breaker_enabled: bool = True,
+        cb_failure_threshold: int = 5,
+        cb_window_seconds: float = 60.0,
+        cb_recovery_timeout: float = 30.0,):
         self.max_concurrent = max_concurrent
         self.timeout = timeout or aiohttp.ClientTimeout(
             total=30,       # Общий таймаут на весь запрос (от начала до чтения ответа)
@@ -71,8 +81,25 @@ class AsyncCrawler:
             "total_delay": 0.0,
             "last_request": None,
         }
+        self.retry_strategy = RetryStrategy(
+            max_retries=max_retries,
+            backoff_factor=backoff_factor,
+            retry_on=[TransientError, NetworkError],
+        )
+        self.circuit_breaker: CircuitBreaker | None = (
+            CircuitBreaker(
+                failure_threshold=cb_failure_threshold,
+                window_seconds=cb_window_seconds,
+                recovery_timeout=cb_recovery_timeout,
+            ) if circuit_breaker_enabled else None
+        )
+        # счётчик «сколько раз домен был заблокирован» — для crawl-статистики
+        self._request_stats["circuit_open_skipped"] = 0
         
-    
+    async def _fetch_with_retry(self, url: str) -> tuple[int, str]:
+        return await self.retry_strategy.execute_with_retry(
+            self.fetch_with_status, url,
+        )
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._connector = aiohttp.TCPConnector(
@@ -93,12 +120,43 @@ class AsyncCrawler:
 
     async def _fetch_guarded(self, url: str) -> tuple[int, str]:
         await self._get_session()
+
+        if not await self._check_robots(url):
+            raise PermanentError(f"{url}: blocked by robots.txt")
+        domain = urlparse(url).netloc
+        if self.circuit_breaker is not None:
+            if not await self.circuit_breaker.allow_request(domain):
+                self._request_stats["circuit_open_skipped"] += 1
+                logger.warning("Circuit OPEN — пропускаем %s", url)
+                raise CircuitOpenError(f"{url}: circuit open for {domain}")
+
+        await self._wait_before_request(url)
+
+        async with self.sems.limit(url):
+            try:
+                result = await self._fetch_with_retry(url)   # retry внутри
+            except PermanentError:
+            # 404/403 — не считаем «поломкой домена»
+                raise
+            except (TransientError, NetworkError):
+                if self.circuit_breaker is not None:
+                    await self.circuit_breaker.record_failure(domain)
+                raise
+            else:
+                if self.circuit_breaker is not None:
+                    await self.circuit_breaker.record_success(domain)
+                return result
+        """
+        await self._get_session()
         if not await self._check_robots(url):
             self._request_stats["requests"] += 1 
             raise AsyncClientError(f"{url}: blocked by robots.txt")
 
         await self._wait_before_request(url)
 
+        async with self.sems.limit(url):
+            return await self._fetch_with_retry(url)
+        
         async with self.sems.limit(url):
             try:
                 result = await self.fetch_with_status(url)
@@ -115,30 +173,53 @@ class AsyncCrawler:
                 else min(previous * 2, self.backoff_max)
                 )
                 raise
+"""
+    def get_retry_stats(self) -> dict:
+        return self.retry_strategy.get_stats()
+    
+    
 
-        
     async def fetch_with_status(self, url: str) -> tuple[int, str]:
-        """Как fetch_url, но возвращает (status_code, body)."""
         session = await self._get_session()
+        self._request_stats["requests"] += 1
         logger.info("Начало загрузки: %s", url)
         try:
             async with session.get(url) as response:
-                response.raise_for_status()
+                if response.status >= 400:
+                    if response.status in RETRYABLE_STATUS:
+                        logger.error(
+                        "HTTP ошибка для %s: status=%s (retryable)",
+                        url, response.status,
+                        )
+                        raise TransientError(
+                        f"{url}: HTTP {response.status}",
+                        status=response.status,
+                        )
+                    logger.error(
+                    "HTTP ошибка для %s: status=%s",
+                    url, response.status,
+                    )
+                    raise PermanentError(
+                    f"{url}: HTTP {response.status}",
+                    status=response.status,
+                    )
+
                 text = await response.text()
                 logger.info(
-                    "Успешно загружено: %s (status=%s, len=%d)",
-                    url, response.status, len(text),
+                "Успешно загружено: %s (status=%s, len=%d)",
+                url, response.status, len(text),
                 )
                 return response.status, text
-        except aiohttp.ClientResponseError as e:
-            logger.error("HTTP ошибка для %s: status=%s, message=%s", url, e.status, e.message)
-            raise AsyncClientResponseError(f"{url}: HTTP {e.status}", status=e.status) from e
+
         except asyncio.TimeoutError as e:
             logger.error("Таймаут при загрузке %s", url)
             raise AsyncTimeoutError(f"{url}: timeout") from e
+        except aiohttp.ClientConnectorError as e:
+            logger.error("Сетевая ошибка для %s: %s", url, e)
+            raise NetworkError(f"{url}: {e}") from e
         except aiohttp.ClientError as e:
             logger.error("Сетевая ошибка для %s: %s", url, e)
-            raise AsyncClientError(f"{url}: {e}") from e
+            raise NetworkError(f"{url}: {e}") from e
 
     async def fetch_url(self, url: str) -> str:
         _, text = await self._fetch_guarded(url)
@@ -281,6 +362,22 @@ class AsyncCrawler:
                         await queue.add_url(link, priority=-depth, depth=depth + 1)
 
             await queue.mark_processed(url, result)
+        except CircuitOpenError as e:
+            result["error"] = "circuit_open"
+            result["error_type"] = "circuit_open"
+            await queue.mark_failed(url, result["error"])
+        except PermanentError as e:
+            result["error"] = f"permanent: {e}"
+            result["error_type"] = "permanent"
+            await queue.mark_failed(url, result["error"])
+        except TransientError as e:
+            result["error"] = f"transient: {e}"
+            result["error_type"] = "transient"
+            await queue.mark_failed(url, result["error"])
+        except NetworkError as e:
+            result["error"] = f"network: {e}"
+            result["error_type"] = "network"
+            await queue.mark_failed(url, result["error"])
         except AsyncClientResponseError as e:
             result["error"] = f"HTTP {e.status}"
             await queue.mark_failed(url, result["error"])
@@ -327,7 +424,7 @@ class AsyncCrawler:
         if not queue:
             logger.info("Нет URL для обхода после фильтрации")
             return results
-
+        
         stop = asyncio.Event()
         pages_done = 0
 
@@ -422,22 +519,23 @@ class AsyncCrawler:
         )
 
         requests = stats["requests"]
-
-        stats["requests_per_sec"] = (
-        requests / elapsed
-        )
-
-        stats["average_delay"] = (
-            stats["total_delay"] / requests
-            if requests
-            else 0.0
-        )
-
+        stats["requests_per_sec"] = requests / elapsed if elapsed else 0.0
+        stats["average_delay"] = elapsed / requests if requests else 0.0
         stats["elapsed_sec"] = elapsed
-        stats["blocked_ratio"] = (
-        stats["blocked_robots"] / requests if requests else 0.0
+
+   
+        total_wait = stats.pop("total_delay", 0.0)
+        stats["total_wait_sum"] = total_wait
+        stats["avg_wait_per_attempt"] = (
+            total_wait / requests if requests else 0.0
         )
 
+        stats["blocked_ratio"] = (
+            stats["blocked_robots"] / requests if requests else 0.0
+        )
+        if self.circuit_breaker is not None:
+            stats["circuit_breaker"] = self.circuit_breaker.get_stats()
+        
         return stats
 
 _NOISE_TAGS = ("script", "style", "noscript", "template", "iframe", "svg")
@@ -856,7 +954,7 @@ class RobotsParser:
         return (
             f"{parsed.scheme}://{parsed.netloc}/robots.txt"
         )
-
+    
     async def fetch_robots(
         self,
         base_url: str,
@@ -927,51 +1025,97 @@ class RobotsParser:
                             "robots.txt %s загружен (%d строк)",
                             robots_url, len(text.splitlines()), delay_value, 
                         )
-                        print(f"DEBUG [else]: text={text!r}")
-                        print(f"DEBUG [else]: delay_value={delay_value!r} type={type(delay_value).__name__}")
+                       # print(f"DEBUG [else]: text={text!r}")
+                       # print(f"DEBUG [else]: delay_value={delay_value!r} type={type(delay_value).__name__}")
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 # Сеть отвалилась / таймаут — не блокируем обход
-                print(f"DEBUG [except]: {type(e).__name__}: {e}")
+               # print(f"DEBUG [except]: {type(e).__name__}: {e}")
                 logger.warning(
                     "Ошибка загрузки robots.txt %s: %s — разрешаем всё",
                     robots_url, e,
                 )
                 parser.parse([])
                 delay_value = 0.0
-            print(f"DEBUG [cache]: domain={domain} delay_value={delay_value!r}")
+            #print(f"DEBUG [cache]: domain={domain} delay_value={delay_value!r}")
             async with self._cache_lock:
                 self._cache[domain] = parser
                 self._crawl_delays[domain] = delay_value
 
             return self._build_result(domain, parser)
 
+    def _normalize_ua_token(self, ua: str) -> str:
+        ua = (ua or "").strip().lower()
+        if not ua:
+            return ""
+        for sep in ("/", " "):
+            if sep in ua:
+                ua = ua.split(sep, 1)[0]
+        return ua
     def _parse_crawl_delay(self, text: str, user_agent: str) -> float:
+        ua_token = self._normalize_ua_token(user_agent)
+
         current_agents: list[str] = []
-        best: float | None = None
-        ua_lower = user_agent.lower()
+        current_delay: float | None = None
+        in_rules = False          
+
+        best_delay: float = 0.0
+        best_level: int = 0       # 2 = точное совпадение, 1 = wildcard, 0 = нет
+
+        def _flush() -> None:
+       
+            nonlocal best_delay, best_level
+            if not in_rules or current_delay is None:
+                return
+
+            if ua_token and ua_token in current_agents:
+                level = 2                       # точное совпадение product-token
+            elif "*" in current_agents:
+                level = 1                       # wildcard
+            else:
+                return                          # группа не про нас
+
+            if level > best_level or (level == best_level and current_delay > best_delay):
+                best_delay = current_delay
+                best_level = level
 
         for raw in text.splitlines():
             line = raw.strip()
             if not line or line.startswith("#") or ":" not in line:
                 continue
+
             key, _, value = line.partition(":")
             key = key.strip().lower()
             value = value.strip()
 
             if key == "user-agent":
-                current_agents.append(value.lower()) 
+                if in_rules:
+                # Новая группа: сохраняем предыдущую, начинаем с чистого листа
+                    _flush()
+                    current_agents = []
+                    current_delay = None
+                    in_rules = False
+                current_agents.append(self._normalize_ua_token(value))
+
             elif key == "crawl-delay":
-                applies = ua_lower in current_agents or "*" in current_agents
-                if not applies:
-                    continue
+                in_rules = True
                 try:
                     d = float(value)
                 except ValueError:
+                    logger.debug("Некорректный Crawl-delay: %r", value)
                     continue
-                if best is None or d > best:
-                    best = d
-        return best if best is not None else 0.0
+            # В одной группе max — безопаснее (более вежливо)
+                if current_delay is None or d > current_delay:
+                    current_delay = d
+
+            else:
+            
+                in_rules = True
+
+        _flush()
+        return best_delay
+
+
     
     def get_crawl_delay(
         self,
@@ -994,14 +1138,11 @@ class RobotsParser:
         return 0.0
     
     def _build_result(self, domain: str, parser: RobotFileParser) -> dict:
-        delay = self._crawl_delays.get(domain)    
-        print(f"DEBUG [_build_result]: domain={domain} "
-          f"keys={list(self._crawl_delays.keys())} "
-          f"_crawl_delays.get={delay}")      
+        delay = self._crawl_delays.get(domain)        
         if delay is None:                                # только если не нашли
             raw = parser.crawl_delay(self.user_agent)
             delay = float(raw) if raw is not None else 0.0
-        print(f"DEBUG [_build_result]: returning crawl_delay={delay}")
+        #print(f"DEBUG [_build_result]: returning crawl_delay={delay}")
         return {
             "domain": domain,
             "url": parser.url,
@@ -1022,3 +1163,157 @@ class RobotsParser:
             return True
 
         return parser.can_fetch(user_agent, url)
+
+
+T = TypeVar("T")
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_retries: int
+    backoff_factor: float
+    initial_delay: float
+    max_delay: float
+    jitter: float
+
+
+DEFAULT_POLICIES: dict[type[BaseException], RetryPolicy] = {
+    TransientError: RetryPolicy(
+        max_retries=3, backoff_factor=2.0,
+        initial_delay=2.0, max_delay=30.0, jitter=0.3,
+    ),
+    NetworkError: RetryPolicy(
+        max_retries=2, backoff_factor=1.5,
+        initial_delay=0.5, max_delay=5.0, jitter=0.2,
+    ),
+}
+
+@dataclass
+class RetryStats:
+    attempts_total: int = 0
+    successes: int = 0
+    failures: int = 0
+    retries: int = 0
+    errors_by_type: dict[str, int] = field(default_factory=dict)
+    total_wait: float = 0.0
+    permanent_failures: list[str] = field(default_factory=list)
+
+class RetryStrategy:
+    def __init__(
+        self,
+        max_retries: int = 3,
+        backoff_factor: float = 2.0,
+        initial_delay: float = 1.0,
+        max_delay: float = 30.0,
+        jitter: float = 0.3,
+        retry_on: list[type[BaseException]] | None = None,
+        timeout_escalation: float = 1.5,
+    ):
+        self.max_retries = max_retries
+        self.backoff_factor = backoff_factor
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+        self.jitter = jitter
+        self.retry_on = tuple(
+            retry_on or (TransientError, NetworkError, AsyncTimeoutError)
+        )
+        self.timeout_escalation = timeout_escalation
+
+        self.stats = RetryStats()
+    def get_stats(self) -> dict:
+        s = self.stats
+        avg_wait = s.total_wait / s.retries if s.retries else 0.0
+        return {
+            "attempts_total": s.attempts_total,
+            "successes": s.successes,
+            "failures": s.failures,
+            "retries": s.retries,
+            "errors_by_type": dict(s.errors_by_type),
+            "avg_wait_per_retry": round(avg_wait, 3),
+            "permanent_failures": list(s.permanent_failures),
+        }
+    def _is_retryable(self, exc: BaseException) -> bool:
+        return isinstance(exc, self.retry_on)
+    
+    def _timeout_for_attempt(self, attempt: int, base: aiohttp.ClientTimeout) -> aiohttp.ClientTimeout:
+        factor = self.timeout_escalation ** attempt
+        return aiohttp.ClientTimeout(
+            total=base.total * factor if base.total else None,
+            connect=base.connect * factor if base.connect else None,
+            sock_read=base.sock_read * factor if base.sock_read else None,
+        )
+    def _delay_for_attempt(self, attempt: int, exc: BaseException | None = None) -> float:
+        policy = DEFAULT_POLICIES.get(type(exc)) if exc else None
+        if policy is None:
+            return self.initial_delay * (self.backoff_factor ** attempt)
+        base = min(
+        policy.initial_delay * (policy.backoff_factor ** attempt),
+        policy.max_delay,
+    )
+        return base + random.uniform(0, base * policy.jitter)
+
+    async def execute_with_retry(
+        self,
+        coro: Callable[..., Awaitable[T]],
+        *args,
+        **kwargs,
+    ) -> T:
+        last_exc: BaseException | None = None
+
+        for attempt in range(self.max_retries + 1):
+            self.stats.attempts_total += 1
+            try:
+                result = await coro(*args, **kwargs)
+                self.stats.successes += 1
+                return result
+            except PermanentError as e:
+                self.stats.failures += 1
+                self.stats.errors_by_type["PermanentError"] = (
+                    self.stats.errors_by_type.get("PermanentError", 0) + 1
+                )
+                self.stats.permanent_failures.append(str(e))
+                logger.error(
+                    "PermanentError (без повтора), попытка %d: %s",
+                    attempt + 1, e,
+                )
+                raise
+
+            except BaseException as e:
+                last_exc = e
+                err_name = type(e).__name__
+                self.stats.errors_by_type[err_name] = (
+                    self.stats.errors_by_type.get(err_name, 0) + 1
+                )
+
+                if not self._is_retryable(e):
+                    self.stats.failures += 1
+                    logger.error(
+                        "Неповторяемая ошибка %s, попытка %d: %s",
+                        err_name, attempt + 1, e,
+                    )
+                    raise
+
+                if attempt >= self.max_retries:
+                    self.stats.failures += 1
+                    logger.error(
+                        "Исчерпаны повторы (%d/%d) для %s: %s",
+                        attempt + 1, self.max_retries + 1, err_name, e,
+                    )
+                    raise
+
+                delay = self._delay_for_attempt(attempt)
+                self.stats.retries += 1
+                self.stats.total_wait += delay
+                logger.warning(
+                    "Повтор %d/%d через %.2fs после %s: %s",
+                    attempt + 1, self.max_retries, delay, err_name, e,
+                )
+                await asyncio.sleep(delay)
+            logger.info(
+            "Успех после %d попыток: %s",
+            attempt + 1, getattr(coro, "__name__", "coro"),
+            )
+        # сюда не должны попасть
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("execute_with_retry: неожиданный выход из цикла")
+

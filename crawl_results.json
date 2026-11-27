@@ -87,17 +87,29 @@
     }
   },
   "failed": {
-    "http://127.0.0.1:8766/private/secret": "blocked_by_robots"
+    "http://127.0.0.1:8766/private/secret": "permanent: http://127.0.0.1:8766/private/secret: blocked by robots.txt"
   },
   "request_stats": {
-    "requests": 7,
+    "requests": 6,
     "blocked_robots": 1,
-    "total_delay": 7.976403280319859,
     "last_request": null,
-    "requests_per_sec": 2.282436024834721,
-    "average_delay": 1.139486182902837,
-    "elapsed_sec": 3.0668986660894006,
-    "blocked_ratio": 0.14285714285714285
+    "circuit_open_skipped": 0,
+    "requests_per_sec": 1.9579158761892779,
+    "average_delay": 0.5107471736458441,
+    "elapsed_sec": 3.0644830418750644,
+    "total_wait_sum": 7.722090078085889,
+    "avg_wait_per_attempt": 1.287015013014315,
+    "blocked_ratio": 0.16666666666666666,
+    "circuit_breaker": {
+      "127.0.0.1:8766": {
+        "state": "closed",
+        "recent_failures": 0,
+        "total_failures": 0,
+        "total_successes": 6,
+        "total_opens": 0,
+        "reopens_in": 0.0
+      }
+    }
   },
   "queue_stats": {
     "queued": 0,
@@ -105,7 +117,7 @@
     "processed": 6,
     "failed": 1,
     "total_done": 7,
-    "rate_per_sec": 2.2824822907349205,
-    "elapsed_sec": 3.07
+    "rate_per_sec": 2.2842845728128958,
+    "elapsed_sec": 3.06
   }
 }

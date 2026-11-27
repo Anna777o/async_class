@@ -5,12 +5,17 @@ import aiohttp
 import pytest
 from aiohttp import web
 from models import HTMLParser
-from models import AsyncCrawler, URLFilter, CrawlerQueue, RateLimiter, RobotsParser
+from models import AsyncCrawler, URLFilter, CrawlerQueue, RateLimiter, RobotsParser, RetryStrategy
 from utils import (
     AsyncClientError,
     AsyncTimeoutError,
     AsyncClientResponseError,
+    TransientError, 
+    NetworkError,
+    PermanentError,
+    CircuitOpenError
 )
+from circuit_breaker import CircuitBreaker
 from urllib.parse import urlparse
 
 
@@ -653,3 +658,145 @@ async def test_backoff_resets_on_success():
     # успех в _fetch_guarded сбрасывает:
     c._backoff["x.com"] = 0.0
     assert c._backoff["x.com"] == 0.0
+
+def test_crawl_delay_matches_product_token():
+    """MyBot/1.0 должен совпасть с User-agent: MyBot."""
+    rp = RobotsParser(user_agent="MyBot/1.0")
+    text = "User-agent: MyBot\nCrawl-delay: 2.0\n"
+    assert rp._parse_crawl_delay(text, "MyBot/1.0") == pytest.approx(2.0)
+
+
+def test_crawl_delay_does_not_mix_groups():
+    """Crawl-delay второй группы не должен влиять на UA первой."""
+    rp = RobotsParser(user_agent="bot1/1.0")
+    text = (
+        "User-agent: bot1\nCrawl-delay: 1.0\n\n"
+        "User-agent: bot2\nCrawl-delay: 9.0\n"
+    )
+    assert rp._parse_crawl_delay(text, "bot1/1.0") == pytest.approx(1.0)
+
+
+def test_crawl_delay_specific_beats_wildcard():
+    """Специфичная группа важнее User-agent: *."""
+    rp = RobotsParser(user_agent="MyBot")
+    text = (
+        "User-agent: *\nCrawl-delay: 5.0\n\n"
+        "User-agent: MyBot\nCrawl-delay: 1.0\n"
+    )
+    assert rp._parse_crawl_delay(text, "MyBot") == pytest.approx(1.0)
+
+
+def test_crawl_delay_shared_group():
+    """Несколько User-agent подряд — одна группа."""
+    rp = RobotsParser(user_agent="bot1")
+    text = (
+        "User-agent: bot1\n"
+        "User-agent: bot2\n"
+        "Crawl-delay: 5.0\n"
+    )
+    assert rp._parse_crawl_delay(text, "bot1") == pytest.approx(5.0)
+
+
+def test_crawl_delay_no_match():
+    rp = RobotsParser(user_agent="MyBot")
+    text = "User-agent: googlebot\nCrawl-delay: 10.0\n"
+    assert rp._parse_crawl_delay(text, "MyBot") == pytest.approx(0.0)
+
+
+def test_crawl_delay_wildcard_only():
+    rp = RobotsParser(user_agent="MyBot/1.0")
+    text = "User-agent: *\nCrawl-delay: 3.0\n"
+    assert rp._parse_crawl_delay(text, "MyBot/1.0") == pytest.approx(3.0)
+
+async def test_robots_parsing_ua_with_version(robots_server):
+    base = str(robots_server.make_url("/"))
+    rp = RobotsParser(user_agent="TestBot/1.0")
+    async with aiohttp.ClientSession() as s:
+        rp.session = s
+        result = await rp.fetch_robots(base)
+    assert result["crawl_delay"] == pytest.approx(0.4)
+    assert rp.get_crawl_delay("TestBot/1.0", base_url=base) == pytest.approx(0.4)
+
+async def test_request_stats_consistent(one_more_site):
+    """requests_per_sec и average_delay должны быть взаимно обратны."""
+    start = str(one_more_site.make_url("/"))
+    async with AsyncCrawler(
+        max_concurrent=3, requests_per_second=2.0,
+        respect_robots=False, min_delay=0.0,
+    ) as c:
+        await c.crawl([start], max_pages=3, same_domain_only=True)
+        s = c.get_request_stats()
+
+    assert s["requests"] > 0
+    product = s["requests_per_sec"] * s["average_delay"]
+    assert product == pytest.approx(1.0, rel=0.1), \
+        f"метрики не сходятся: {s['requests_per_sec']:.2f} × {s['average_delay']:.3f} = {product:.2f}"
+#day5 
+
+def make_flaky(exc_sequence):
+    calls = {"n": 0}
+    async def coro():
+        i = calls["n"]
+        calls["n"] += 1
+        if i < len(exc_sequence) and exc_sequence[i] is not None:
+            raise exc_sequence[i]
+        return "ok"
+    return coro, calls
+
+
+async def test_retry_on_transient_then_success():
+    coro, calls = make_flaky([TransientError("503"), None])
+    rs = RetryStrategy(max_retries=3, initial_delay=0.01, jitter=0)
+    result = await rs.execute_with_retry(coro)
+    assert result == "ok"
+    assert calls["n"] == 2
+    assert rs.stats.retries == 1
+
+
+async def test_no_retry_on_permanent():
+    coro, calls = make_flaky([PermanentError("404")])
+    rs = RetryStrategy(max_retries=3, initial_delay=0.01, jitter=0)
+    with pytest.raises(PermanentError):
+        await rs.execute_with_retry(coro)
+    assert calls["n"] == 1                  # только одна попытка
+    assert rs.stats.permanent_failures
+
+
+async def test_exponential_backoff_timing():
+    coro, _ = make_flaky([TransientError("t")] * 3 + [None])
+    rs = RetryStrategy(
+        max_retries=3, backoff_factor=2.0,
+        initial_delay=0.1, jitter=0,
+    )
+    t0 = time.monotonic()
+    await rs.execute_with_retry(coro)
+    elapsed = time.monotonic() - t0
+    # 0.1 + 0.2 + 0.4 = 0.7 (с допуском)
+    assert 0.65 <= elapsed <= 0.9
+
+
+async def test_retry_after_429(aiohttp_server):
+    calls = {"n": 0}
+    async def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return web.Response(status=429, headers={"Retry-After": "1"})
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", handler)
+    server = await aiohttp_server(app)
+
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        async def fetch():
+            async with session.get(str(server.make_url("/"))) as r:
+                if r.status == 429:
+                    await asyncio.sleep(float(r.headers["Retry-After"]))
+                    raise TransientError("429")
+                return await r.text()
+
+        rs = RetryStrategy(max_retries=2, initial_delay=0.01, jitter=0)
+        result = await rs.execute_with_retry(fetch)
+        assert result == "ok"
+        assert calls["n"] == 2

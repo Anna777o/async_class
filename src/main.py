@@ -4,6 +4,7 @@ import time
 import json
 from models import AsyncCrawler, HTMLParser
 from utils import AsyncClientError, AsyncTimeoutError, AsyncClientResponseError
+import aiohttp
 from aiohttp import web
 
 URLS = [
@@ -370,7 +371,7 @@ async def main4() -> None:
         await runner.cleanup()
 
     elapsed = time.perf_counter() - t0
-
+    
     # ─────────── 1. Сводка ───────────
     print("\n" + "=" * 70)
     print(f"Обработано страниц: {len(results)}")
@@ -378,7 +379,7 @@ async def main4() -> None:
     print(f"Скорость crawler: {len(results) / elapsed:.2f} стр/сек")
     print(f"Запросов (fetch): {request_stats['requests']}")
     print(f"Текущая скорость: {request_stats['requests_per_sec']:.2f} req/sec")
-    print(f"Средняя задержка: {request_stats['average_delay'] * 1000:.0f} мс")
+    print(f"Средняя задержка: {request_stats['average_delay']*1000:.0f} мс")
     print(f"Заблокировано robots.txt: {request_stats['blocked_robots']}")
     print(f"Статистика очереди: {queue_stats}")
     print(f"Активно: total={crawler.sems.active_total}, "
@@ -429,12 +430,88 @@ async def main4() -> None:
         )
     print("\nРезультаты сохранены: crawl_results.json")
 
+async def start_site2(port: int = 8767) -> web.AppRunner:
+    state = {"503_count": 0, "429_count": 0}
+
+    async def ok(request):
+        return web.Response(text="<html><body>OK</body></html>", content_type="text/html")
+
+    async def not_found(request):
+        raise web.HTTPNotFound(text="nope")
+
+    async def service_unavailable(request):
+        state["503_count"] += 1
+        if state["503_count"] <= 2:          # первые 2 раза — 503
+            raise web.HTTPServiceUnavailable(text="try later")
+        return web.Response(text="<html><body>Finally OK</body></html>",
+                            content_type="text/html")
+
+    async def too_many(request):
+        state["429_count"] += 1
+        if state["429_count"] <= 1:
+            raise web.HTTPTooManyRequests(
+                text="slow down", headers={"Retry-After": "1"},
+            )
+        return web.Response(text="<html><body>OK after 429</body></html>",
+                            content_type="text/html")
+
+    async def slow(request):
+        await asyncio.sleep(5)                # гарантированный таймаут
+        return web.Response(text="never")
+
+    app = web.Application()
+    app.router.add_get("/ok", ok)
+    app.router.add_get("/404", not_found)
+    app.router.add_get("/503", service_unavailable)
+    app.router.add_get("/429", too_many)
+    app.router.add_get("/slow", slow)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    return runner
+
+
+async def main5():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    runner = await start_site2()
+    base = "http://127.0.0.1:8767"
+    urls = [f"{base}/ok", f"{base}/404", f"{base}/503", f"{base}/429", f"{base}/slow"]
+
+    try:
+        async with AsyncCrawler(
+            max_concurrent=5,
+            per_domain_limit=5,
+            timeout=aiohttp.ClientTimeout(total=2, connect=1, sock_read=1),
+            max_retries=3,
+            backoff_factor=2.0,
+            respect_robots=False,             # для демо robots не нужен
+        ) as crawler:
+            t0 = time.perf_counter()
+            results = await crawler.fetch_urls(urls)
+            elapsed = time.perf_counter() - t0
+
+            retry_stats = crawler.get_retry_stats()
+    finally:
+        await runner.cleanup()
+
+    print("\n" + "=" * 70)
+    print(f"Обработано URL: {len(results)} из {len(urls)}")
+    print(f"Время: {elapsed:.2f} сек")
+    print(f"Статистика RetryStrategy: {retry_stats}")
+    print("=" * 70)
+    for url in urls:
+        ok = "OK" if url in results else "FAIL"
+        print(f"  {ok:4} {url}")
+
 if __name__ == "__main__":
     print("day1")
    # asyncio.run(main())
     print("day2")
   #  asyncio.run(main2())
     print("day3")
-   # asyncio.run(main3())
+   # asyncio.zun(main3())
     print("day4")
     asyncio.run(main4())
+    print("day5")
+    asyncio.run(main5())
